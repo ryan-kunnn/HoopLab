@@ -16,12 +16,6 @@ parser.add_argument(
     help="Input video path. Relative paths are resolved from the HoopLab.py folder.",
 )
 parser.add_argument(
-    "--view",
-    choices=["auto", "front", "back", "left", "right"],
-    default="auto",
-    help="Camera view. Use front/back/left/right for your test videos, or auto to infer it.",
-)
-parser.add_argument(
     "--no-display",
     action="store_true",
     help="Run analysis without opening the OpenCV preview window.",
@@ -147,7 +141,6 @@ class PostureTrainingAnalyzer:
             "torso_lean": metrics.get("torso_lean", 0),
             "balance_shift": metrics.get("balance_shift", 0),
             "follow_through": metrics["follow_through"],
-            "view": metrics.get("view", "unknown"),
             "outcomes": self.classify_metric_outcomes(metrics),
             "recommendations": self.get_training_recommendations(metrics),
         }
@@ -212,7 +205,6 @@ class PostureTrainingAnalyzer:
         postures = self.sessions[-1]["postures"]
         print(f"Video: {video_path}")
         print(f"Detected shots/postures: {len(postures)}")
-        print(f"Camera views seen: {', '.join(sorted(set(p['view'] for p in postures)))}")
 
         outcome_counts = {}
         for posture in postures:
@@ -225,8 +217,6 @@ class PostureTrainingAnalyzer:
 
         print("\nPosture details:")
         for i, posture in enumerate(postures, 1):
-            print(f"   Best posture frame: {posture['frame']}")
-            print(f"   View: {posture['view']}")
             print(f"   Arm extension: {posture['release_angle']:.1f} deg")
             print(f"   Shoulder position: {posture['shoulder_angle']:.1f} deg")
             print(f"   Knee bend: {posture['knee_bend']:.1f} deg")
@@ -244,20 +234,17 @@ class PostureTrainingAnalyzer:
 class ShootingPostureAnalyzer:
     RELEASE_DISPLAY_FRAMES = 9
 
-    def __init__(self, requested_view="auto"):
+    def __init__(self):
         self.angle_history = {
             "elbow": deque(maxlen=5),
             "shoulder": deque(maxlen=5),
             "knee": deque(maxlen=5),
         }
-        self.view_history = deque(maxlen=12)
         self.phase = "READY"
         self.display_phase = "READY"
         self.release_display_until_frame = 0
         self.phase_start_frame = 0
         self.shooting_arm = None
-        self.requested_view = requested_view
-        self.camera_view = requested_view if requested_view != "auto" else "unknown"
         self.balance_shift_peak = 0
         self.best_candidate = None
         self.best_candidate_frame = 0
@@ -274,7 +261,6 @@ class ShootingPostureAnalyzer:
             "balance_shift": 0,
             "follow_through": False,
             "posture_score": 0,
-            "view": self.camera_view,
         }
 
     def calculate_angle(self, a, b, c):
@@ -304,6 +290,28 @@ class ShootingPostureAnalyzer:
     def get_visibility(self, landmarks, landmark_id):
         return landmarks[landmark_id].visibility
 
+    def arm_landmarks(self, side):
+        if side == "right":
+            return {
+                "shoulder": mp_pose.PoseLandmark.RIGHT_SHOULDER,
+                "elbow": mp_pose.PoseLandmark.RIGHT_ELBOW,
+                "wrist": mp_pose.PoseLandmark.RIGHT_WRIST,
+                "hip": mp_pose.PoseLandmark.RIGHT_HIP,
+                "knee": mp_pose.PoseLandmark.RIGHT_KNEE,
+                "ankle": mp_pose.PoseLandmark.RIGHT_ANKLE,
+                "opposite_shoulder": mp_pose.PoseLandmark.LEFT_SHOULDER,
+            }
+
+        return {
+            "shoulder": mp_pose.PoseLandmark.LEFT_SHOULDER,
+            "elbow": mp_pose.PoseLandmark.LEFT_ELBOW,
+            "wrist": mp_pose.PoseLandmark.LEFT_WRIST,
+            "hip": mp_pose.PoseLandmark.LEFT_HIP,
+            "knee": mp_pose.PoseLandmark.LEFT_KNEE,
+            "ankle": mp_pose.PoseLandmark.LEFT_ANKLE,
+            "opposite_shoulder": mp_pose.PoseLandmark.RIGHT_SHOULDER,
+        }
+
     def update_display_phase(self, frame_num):
         if self.phase == "RELEASE":
             self.display_phase = "RELEASE"
@@ -316,82 +324,65 @@ class ShootingPostureAnalyzer:
         else:
             self.display_phase = self.phase
 
-    def detect_camera_view(self, landmarks):
-        if self.requested_view != "auto":
-            self.camera_view = self.requested_view
-            return self.camera_view
+    def score_arm_activity(self, landmarks, width, height, side):
+        ids = self.arm_landmarks(side)
+        shoulder = ids["shoulder"]
+        elbow = ids["elbow"]
+        wrist = ids["wrist"]
 
-        left_shoulder = landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER]
-        right_shoulder = landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER]
-        nose = landmarks[mp_pose.PoseLandmark.NOSE]
+        visibility = (
+            self.get_visibility(landmarks, shoulder)
+            + self.get_visibility(landmarks, elbow)
+            + self.get_visibility(landmarks, wrist)
+        ) / 3
 
-        shoulder_span = abs(left_shoulder.x - right_shoulder.x)
-        shoulder_depth = abs(left_shoulder.z - right_shoulder.z)
+        shoulder_coords = self.get_landmark_coords(landmarks, width, height, shoulder)
+        wrist_coords = self.get_landmark_coords(landmarks, width, height, wrist)
+        shoulder_point = self.get_landmark_point(landmarks, width, height, shoulder)
+        elbow_point = self.get_landmark_point(landmarks, width, height, elbow)
+        wrist_point = self.get_landmark_point(landmarks, width, height, wrist)
+        elbow_angle = self.calculate_angle(shoulder_point, elbow_point, wrist_point)
 
-        if shoulder_span < 0.14 or shoulder_depth > 0.16:
-            view = "right" if right_shoulder.z < left_shoulder.z else "left"
-        elif nose.visibility >= 0.50:
-            view = "front"
-        else:
-            view = "back"
+        wrist_above_shoulder = max(0, shoulder_coords[1] - wrist_coords[1])
+        wrist_near_shoulder = max(0, 70 - abs(wrist_coords[1] - shoulder_coords[1]))
+        shooting_shape = max(0, 170 - abs(145 - elbow_angle))
 
-        self.view_history.append(view)
-        self.camera_view = max(set(self.view_history), key=self.view_history.count)
-        return self.camera_view
+        return (
+            visibility * 120
+            + wrist_above_shoulder * 0.8
+            + wrist_near_shoulder * 0.35
+            + shooting_shape * 0.4
+        )
 
     def detect_shooting_arm(self, landmarks, width, height):
-        right_visibility = (
-            self.get_visibility(landmarks, mp_pose.PoseLandmark.RIGHT_SHOULDER)
-            + self.get_visibility(landmarks, mp_pose.PoseLandmark.RIGHT_ELBOW)
-            + self.get_visibility(landmarks, mp_pose.PoseLandmark.RIGHT_WRIST)
-        )
-        left_visibility = (
-            self.get_visibility(landmarks, mp_pose.PoseLandmark.LEFT_SHOULDER)
-            + self.get_visibility(landmarks, mp_pose.PoseLandmark.LEFT_ELBOW)
-            + self.get_visibility(landmarks, mp_pose.PoseLandmark.LEFT_WRIST)
-        )
+        right_score = self.score_arm_activity(landmarks, width, height, "right")
+        left_score = self.score_arm_activity(landmarks, width, height, "left")
 
-        if self.camera_view == "right":
-            return "right" if right_visibility >= 1.0 else "left"
-        if self.camera_view == "left":
-            return "left" if left_visibility >= 1.0 else "right"
+        if self.shooting_arm == "right":
+            right_score += 25
+        elif self.shooting_arm == "left":
+            left_score += 25
 
-        right_wrist = self.get_landmark_coords(landmarks, width, height, mp_pose.PoseLandmark.RIGHT_WRIST)
-        left_wrist = self.get_landmark_coords(landmarks, width, height, mp_pose.PoseLandmark.LEFT_WRIST)
-        right_shoulder = self.get_landmark_coords(landmarks, width, height, mp_pose.PoseLandmark.RIGHT_SHOULDER)
-        left_shoulder = self.get_landmark_coords(landmarks, width, height, mp_pose.PoseLandmark.LEFT_SHOULDER)
-
-        right_wrist_relative = right_wrist[1] - right_shoulder[1]
-        left_wrist_relative = left_wrist[1] - left_shoulder[1]
-        if right_wrist_relative < left_wrist_relative:
-            return "right"
-        return "left"
+        return "right" if right_score >= left_score else "left"
 
     def analyze_posture(self, landmarks, width, height, frame_num):
         if not landmarks:
             return None, None
 
-        self.detect_camera_view(landmarks)
+        detected_arm = self.detect_shooting_arm(landmarks, width, height)
+        if self.shooting_arm != detected_arm and self.phase == "READY":
+            for key in self.angle_history:
+                self.angle_history[key].clear()
+        self.shooting_arm = detected_arm
 
-        if self.shooting_arm is None:
-            self.shooting_arm = self.detect_shooting_arm(landmarks, width, height)
-
-        if self.shooting_arm == "right":
-            shoulder = mp_pose.PoseLandmark.RIGHT_SHOULDER
-            elbow = mp_pose.PoseLandmark.RIGHT_ELBOW
-            wrist = mp_pose.PoseLandmark.RIGHT_WRIST
-            hip = mp_pose.PoseLandmark.RIGHT_HIP
-            knee = mp_pose.PoseLandmark.RIGHT_KNEE
-            ankle = mp_pose.PoseLandmark.RIGHT_ANKLE
-            opposite_shoulder = mp_pose.PoseLandmark.LEFT_SHOULDER
-        else:
-            shoulder = mp_pose.PoseLandmark.LEFT_SHOULDER
-            elbow = mp_pose.PoseLandmark.LEFT_ELBOW
-            wrist = mp_pose.PoseLandmark.LEFT_WRIST
-            hip = mp_pose.PoseLandmark.LEFT_HIP
-            knee = mp_pose.PoseLandmark.LEFT_KNEE
-            ankle = mp_pose.PoseLandmark.LEFT_ANKLE
-            opposite_shoulder = mp_pose.PoseLandmark.RIGHT_SHOULDER
+        selected = self.arm_landmarks(self.shooting_arm)
+        shoulder = selected["shoulder"]
+        elbow = selected["elbow"]
+        wrist = selected["wrist"]
+        hip = selected["hip"]
+        knee = selected["knee"]
+        ankle = selected["ankle"]
+        opposite_shoulder = selected["opposite_shoulder"]
 
         shoulder_coords = self.get_landmark_coords(landmarks, width, height, shoulder)
         elbow_coords = self.get_landmark_coords(landmarks, width, height, elbow)
@@ -444,7 +435,6 @@ class ShootingPostureAnalyzer:
             "balance_shift": self.balance_shift_peak,
             "follow_through": wrist_coords[1] < shoulder_coords[1] - 15,
             "posture_score": 0,
-            "view": self.camera_view,
         }
         current_metrics["posture_score"] = self.score_metrics(current_metrics)
 
@@ -474,7 +464,6 @@ class ShootingPostureAnalyzer:
                 self.metrics["hip_angle"] = hip_angle
                 self.metrics["torso_lean"] = torso_lean
                 self.metrics["balance_shift"] = self.balance_shift_peak
-                self.metrics["view"] = self.camera_view
         elif self.phase == "RELEASE":
             release_frames = frame_num - self.phase_start_frame
             wrist_above_shoulder = wrist_coords[1] < shoulder_coords[1] - 15
@@ -536,7 +525,6 @@ class ShootingPostureAnalyzer:
             "torso": torso_angle,
             "torso_lean": torso_lean,
             "balance_shift": balance_shift,
-            "view": self.camera_view,
         }
 
     def score_metrics(self, metrics):
@@ -681,7 +669,7 @@ def draw_status_panel(frame, posture_analyzer, training_analyzer, last_recorded_
 
 
 # ---------------- MAIN LOOP ----------------
-posture_analyzer = ShootingPostureAnalyzer(requested_view=args.view)
+posture_analyzer = ShootingPostureAnalyzer()
 training_analyzer = PostureTrainingAnalyzer()
 frame_num = 0
 last_posture_frame = 0
@@ -704,7 +692,6 @@ POSE_CONNECTIONS = [
 ]
 
 print(f"\nStarting posture analysis for {video_path}")
-print(f"Camera view mode: {args.view}")
 print("Press 'r' reset | 'q' quit\n")
 
 while True:
